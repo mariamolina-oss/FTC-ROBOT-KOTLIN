@@ -1,0 +1,743 @@
+package org.firstinspires.ftc.teamcode.systems
+
+import com.bylazar.telemetry.TelemetryManager
+import java.util.function.Supplier
+import com.pedropathing.follower.Follower
+import com.pedropathing.math.Pose
+import com.pedropathing.paths.Path
+import com.qualcomm.robotcore.hardware.HardwareMap
+import com.seattlesolvers.solverslib.command.Command
+import com.seattlesolvers.solverslib.command.ParallelCommandGroup
+import com.seattlesolvers.solverslib.command.RepeatCommand
+import com.seattlesolvers.solverslib.command.SequentialCommandGroup
+import com.seattlesolvers.solverslib.command.SubsystemBase
+import com.seattlesolvers.solverslib.command.WaitCommand
+import com.seattlesolvers.solverslib.command.WaitUntilCommand
+import com.seattlesolvers.solverslib.gamepad.GamepadEx
+import com.seattlesolvers.solverslib.geometry.Pose2d
+import com.seattlesolvers.solverslib.geometry.Rotation2d
+import com.skeletonarmy.marrow.zones.PolygonZone
+import org.firstinspires.ftc.teamcode.autonomous.pedroPathing.Constants
+import org.firstinspires.ftc.teamcode.constants.DriveMultipliers
+import org.firstinspires.ftc.teamcode.constants.FieldDimensions
+import org.firstinspires.ftc.teamcode.constants.FieldTargets
+import org.firstinspires.ftc.teamcode.constants.LocalizationConstants
+import org.firstinspires.ftc.teamcode.constants.RobotDimensions
+import org.firstinspires.ftc.teamcode.constants.RobotTransformations
+import org.firstinspires.ftc.teamcode.constants.ScoringTargets
+import org.firstinspires.ftc.teamcode.constants.SubsystemTolerances
+import org.firstinspires.ftc.teamcode.constants.Zones
+import org.firstinspires.ftc.teamcode.subsystems.indexer.IndexOnDetectionCommand
+import org.firstinspires.ftc.teamcode.subsystems.indexer.Indexer
+import org.firstinspires.ftc.teamcode.subsystems.intake.intakeDeploy.FlowerDropDown
+import org.firstinspires.ftc.teamcode.subsystems.intake.intakeRollers.IntakeRollers
+import org.firstinspires.ftc.teamcode.subsystems.mecanum.Mecanum
+import org.firstinspires.ftc.teamcode.subsystems.shooter.flywheel.Flywheel
+import org.firstinspires.ftc.teamcode.subsystems.shooter.flywheelHardStop.FlywheelHardStop
+import org.firstinspires.ftc.teamcode.subsystems.shooter.hood.Hood
+import org.firstinspires.ftc.teamcode.subsystems.turret.Turret
+import org.firstinspires.ftc.teamcode.subsystems.vision.Limelight
+import org.firstinspires.ftc.teamcode.utils.Alliance
+import org.firstinspires.ftc.teamcode.utils.autonomous.PoseStorage
+import org.firstinspires.ftc.teamcode.utils.extensions.InstantCommand
+import org.firstinspires.ftc.teamcode.utils.extensions.rumble
+import org.firstinspires.ftc.teamcode.utils.extensions.stopRumble
+import org.firstinspires.ftc.teamcode.utils.extensions.toPose2d
+import org.firstinspires.ftc.teamcode.utils.extensions.toTranslation2d
+import org.firstinspires.ftc.teamcode.utils.localization.PoseEstimator
+import org.firstinspires.ftc.teamcode.utils.sensors.DetectedColor
+import org.firstinspires.ftc.teamcode.utils.units.Distance
+import org.firstinspires.ftc.teamcode.utils.units.LinearVelocity
+import java.util.Optional
+import java.util.function.BooleanSupplier
+import kotlin.math.atan2
+import kotlin.math.hypot
+
+class Superstructure(
+    private val hardwareMap: HardwareMap,
+    private val controller: GamepadEx,
+    private val alliance: Alliance,
+    private val telemetryM: TelemetryManager
+): SubsystemBase() {
+
+    // ------------------------------------------ //
+    // --------- Subsystem Declaration ---------- //
+    // ------------------------------------------ //
+    private lateinit var follower: Follower
+    private lateinit var turret: Turret
+    private lateinit var poseEstimator: PoseEstimator
+    private lateinit var mecanum: Mecanum
+    private lateinit var flowerDropDown: FlowerDropDown
+    private lateinit var intakeRollers: IntakeRollers
+    private lateinit var indexer: Indexer
+    private lateinit var hood: Hood
+    private lateinit var flywheel: Flywheel
+    private lateinit var flywheelHardStop: FlywheelHardStop
+    private lateinit var limelight: Limelight
+
+    // ---------------------------------------------------------------- //
+    // - Useful variables (Velocities, distances and dynamic targets) - //
+    // ---------------------------------------------------------------- //
+    private var robotToTurretPose: Pose2d = Pose2d()
+    private var robotZone = PolygonZone(RobotDimensions.ROBOT_WIDTH.inches, RobotDimensions.ROBOT_LENGTH.inches)
+    private var turretDistanceToTarget: Distance = Distance(0.0)
+    private var robotRadialVelocityToTarget: LinearVelocity = LinearVelocity(0.0)
+    private var robotTangentialVelocityToTarget: LinearVelocity = LinearVelocity(0.0)
+    private var scoringTarget = Pose(0.0, 0.0)
+
+    init {
+        subsystemInitialization()
+    }
+
+    private fun subsystemInitialization() {
+        // Follower Initialization
+        follower = Constants.createFollower(hardwareMap)
+        //Turret Initialization
+        turret = Turret(hardwareMap)
+        // Pose Estimator Intialization
+        poseEstimator = PoseEstimator(
+            LocalizationConstants.mount, LocalizationConstants.biobuzzAprilTagDynamicMap, LocalizationConstants.estimatorConfig
+        )
+        // Mecanum Initialization
+        mecanum = Mecanum(follower, controller, alliance)//, poseEstimator) { turret.getServoAbsoluteAngle() }
+        // Intake deploy Initialization
+
+        // Intake Rollers Initialization
+        intakeRollers = IntakeRollers(hardwareMap)
+        // Indexer Initialization
+        indexer = Indexer(hardwareMap)
+        // Hood Initialization
+        hood = Hood(hardwareMap)
+        // Flywheel Initialization
+        flywheel = Flywheel(hardwareMap)
+        // Flywheel hard stop initialization
+        flywheelHardStop = FlywheelHardStop(hardwareMap)
+        // Limelight initialization
+        limelight = Limelight(hardwareMap, mecanum, mecanum.isFilterDisabled)
+    }
+
+    override fun periodic() {
+        val currentPose = mecanum.getPose()
+        val poseX = currentPose.x()
+        val poseY = currentPose.y()
+        val poseHeading = currentPose.heading()
+
+        // Updates robot zone position
+        robotZone.setPosition(poseX, poseY)
+        robotZone.rotation = poseHeading
+
+        // Updates the robot to turret pose by retrieving the Mecanum's pose and transforming it by the Turret Transform2d
+        robotToTurretPose = currentPose.toPose2d().transformBy(RobotTransformations.ROBOT_TO_TURRET_2D)
+
+        scoringTarget = when (alliance) {
+            Alliance.RED -> getRedScoringTarget()
+            Alliance.BLUE -> getBlueScoringTarget()
+        }
+        val targetX = scoringTarget.x()
+        val targetY = scoringTarget.y()
+
+        // Updates the Turret's distance to the current scoring target.
+        turretDistanceToTarget = Distance.fromMeters(
+            hypot(targetX.minus(robotToTurretPose.x), targetY.minus(robotToTurretPose.y))
+        )
+
+        // Updates the robot's radial velocity to the current scoring target
+        robotRadialVelocityToTarget = mecanum.getRobotRadialVelocity(targetX, targetY, robotToTurretPose)
+
+        // Updates the robot's tangential velocity to the current scoring target
+        robotTangentialVelocityToTarget = mecanum.getRobotTangentialVelocity(targetX, targetY, robotToTurretPose)
+    }
+    // --------------- ----- -------- --------------- //
+    // ------------ CONTROLLER COMMANDS ------------- //
+    // --------------- ----- -------- --------------- //
+    fun setControllerRumbleRepeated(): Command {
+        return RepeatCommand(
+            SequentialCommandGroup(
+                controller.rumble(1),
+                WaitCommand(1000)
+            )
+        )
+    }
+
+    fun stopControllerRumble(): Command {
+        return controller.stopRumble()
+    }
+
+
+    // --------------- ----- -------- --------------- //
+    // --------------- DRIVE COMMANDS --------------- //
+    // --------------- ----- -------- --------------- //
+
+    /**
+     * Sets the [Mecanum] default command.
+     */
+    fun setDriveDefaultCommand() {
+        mecanum.defaultCommand = mecanum.driveFollowingDriverInput()
+    }
+
+    /**
+     * Reduces the [Mecanum] by [DriveMultipliers.CONTROLLER_SOTM_LINEAR_MULTIPLIER] for x and y movement and
+     * by [DriveMultipliers.CONTROLLER_SOTM_ANGULAR_MULTIPLIER] for angular movement.
+     * Called for shooting on the move.
+     */
+    fun setDriveSOTMCommand(): Command {
+        return mecanum.driveFieldRelativeScaled(
+            Optional.of(DriveMultipliers.CONTROLLER_SOTM_LINEAR_MULTIPLIER)
+            //Optional.of(DriveMultipliers.CONTROLLER_SOTM_ANGULAR_MULTIPLIER)
+        )
+    }
+
+    /**
+     * Sets the [Mecanum] starting [pose].
+     *  If called inside [org.firstinspires.ftc.teamcode.Robot.initAuto], pass the same argument.
+     *  If called inside [org.firstinspires.ftc.teamcode.Robot.initTeleOp], pass the [PoseStorage.autonomousEndPose].
+     *  No other uses will be required.
+     */
+    fun setPose(pose: Pose?) {
+        mecanum.setPose(pose ?: Pose(0.0, 0.0, 0.0))
+    }
+
+    /** Sets the remembered autonomous pose to teleoperated */
+    fun setLastAutonomousPose() {
+        setPose(PoseStorage.autonomousEndPose)
+    }
+
+    fun followPathCommand(path: Path, holdEnd: Boolean, maxPower: Double): Command {
+        return mecanum.followPathCMD(path, holdEnd, maxPower)
+    }
+
+    fun driveToNearestFlower(): Command {
+        return mecanum.followPathToTargetFieldPosition(getNearestFlower(), true, 0.8)
+    }
+
+    fun driveToLeftPark(): Command {
+        return mecanum.followPathToTargetFieldPosition({ getRightPark() }, true, 0.8)
+    }
+
+    fun driveToRightPark(): Command {
+        return mecanum.followPathToTargetFieldPosition({ getLeftPark() }, true, 0.8)
+    }
+
+    /** Checks whether the [Mecanum] is on the left side of the field. */
+    private fun isDriveOnTopSide(): BooleanSupplier {
+        return { robotZone.isFullyInside(Zones.TOP_SIDE) }
+    }
+
+    /** Based on the robot's position on the field (left/right side) returns the current scoring target. */
+    private fun getScoringTarget(): Supplier<Pose> = Supplier { scoringTarget }
+
+    private fun getRedScoringTarget(): Pose {
+        return if (robotZone.position.x > FieldDimensions.RED_HIVE_CENTER_REFERENCE.x) {
+            if (isDriveOnTopSide().asBoolean) ScoringTargets.RED_HIVE_TOP_RIGHT_TARGET else ScoringTargets.RED_HIVE_BOTTOM_RIGHT_TARGET
+        } else {
+            if (isDriveOnTopSide().asBoolean) ScoringTargets.RED_HIVE_TOP_LEFT_TARGET else ScoringTargets.RED_HIVE_BOTTOM_LEFT_TARGET
+        }
+    }
+
+    private fun getBlueScoringTarget(): Pose {
+        return if (robotZone.position.x > FieldDimensions.BLUE_HIVE_CENTER_REFERENCE.x) {
+            if (isDriveOnTopSide().asBoolean) ScoringTargets.BLUE_HIVE_TOP_RIGHT_TARGET else ScoringTargets.BLUE_HIVE_BOTTOM_RIGHT_TARGET
+        } else {
+            if (isDriveOnTopSide().asBoolean) ScoringTargets.BLUE_HIVE_TOP_LEFT_TARGET else ScoringTargets.BLUE_HIVE_BOTTOM_LEFT_TARGET
+        }
+    }
+
+    // TODO Choose flower based on distance and velocity direction. Avoid confusing between two flowers at the same distance.
+    private fun getNearestFlower(): Supplier<Pose> {
+        return {
+            val distanceList: MutableList<Double> = MutableList(4) { 0.0 }
+
+            // Put distances to every flower in a mutable list
+            for ((index, flower) in FieldTargets.FLOWER_LIST.withIndex()) {
+                distanceList[index] = mecanum.getPose().distance(flower)
+            }
+
+            // Calculate min distance's flower index
+            val minDistance = distanceList.withIndex().minByOrNull { it.value }
+
+            // Return the pose of the flower closest to the robot
+            when (minDistance?.index) {
+                0 -> FieldTargets.RIGHT_FLOWER_INTAKE_POSITION
+                1 -> FieldTargets.TOP_FLOWER_INTAKE_POSITION
+                2 -> FieldTargets.LEFT_FLOWER_INTAKE_POSITION
+                3 -> FieldTargets.BOTTOM_FLOWER_INTAKE_POSITION
+                else -> mecanum.getPose()
+            }
+        }
+    }
+
+    private fun getLeftPark(): Pose {
+        return if (alliance == Alliance.RED) FieldTargets.RED_PARK_LEFT else FieldTargets.BLUE_PARK_LEFT
+    }
+
+    private fun getRightPark(): Pose {
+        return if (alliance == Alliance.RED) FieldTargets.RED_PARK_RIGHT else FieldTargets.BLUE_PARK_RIGHT
+    }
+
+    // --------------- -------- -------- --------------- //
+    // --------------- SEQUENCE COMMANDS --------------- //
+    // --------------- -------- -------- --------------- //
+
+    /**
+     * A [ParallelCommandGroup] which enables both the shooter and the hood, a [WaitUntilCommand] for
+     * the flywheel and turret to reach its target. Once the condition is met, the pathway to the [Flywheel]
+     * is cleared by the [FlywheelHardStop] and the [Indexer] is enabled. Allows SOTM.
+     */
+    fun setScoringSequence(): Command {
+        return ParallelCommandGroup(
+            setIndexerReversedPreset(),
+            setFlywheelCalculatedVelocity(),
+            setHoodCalculatedAngle(),
+            WaitUntilCommand { isFlywheelAtTarget() && isTurretAtTarget() }
+                .andThen(clearPathToFlywheel())
+                .andThen(WaitUntilCommand { isFlywheelHardStopAtTarget() })
+                .andThen(setIndexerShootingPreset()),
+        )
+    }
+
+    fun setConfigurableScoringSequence(): Command {
+        return setIndexerReversedPreset().andThen(ParallelCommandGroup(
+            setFlywheelConfigurableControl(),
+            setHoodConfigurableControl(),
+            WaitCommand(1500)
+                .andThen(clearPathToFlywheel())
+                .andThen(stopIndexer())
+                .andThen(WaitCommand(1000))
+                .andThen(setIndexerShootingPreset())
+                .andThen(setIntakeRollersConfigurableControl()),
+        ))
+    }
+
+    fun setPresetScoringSequence(): Command {
+        return setIndexerReversedPreset().alongWith(setIntakeRollersReversedVelocity()).andThen(
+            ParallelCommandGroup(
+                setDynamicFlywheelPresetShootingVelocity(),
+                setHoodPresetAngle(),
+                WaitCommand(600).andThen(stopIntakeRollers().alongWith(stopIndexer()))
+                    .andThen(WaitUntilCommand { isFlywheelAtTarget() })
+                    .andThen(clearPathToFlywheel())
+                    .andThen(WaitCommand(500))
+                    .andThen(setIndexerShootingPreset())
+                    .andThen(setIntakeRollersFloorVelocity())
+                    .andThen(WaitCommand(300))
+                    .andThen(stopIntakeRollers())
+            ))
+    }
+
+    /**
+     * A [ParallelCommandGroup] which stops the [Flywheel], [Indexer], moves the [Hood] to its home
+     * position and the [FlywheelHardStop]blocks the pathway.
+     */
+    fun stopShootingSequence(): Command {
+        return ParallelCommandGroup(
+            setDynamicFlywheelIdleVelocity(),
+            setHoodHomeAngle(),
+            stopIndexer(),
+            blockPathToFlywheel(),
+            stopIntakeRollers()
+        )
+    }
+
+    /**
+     * A [ParallelCommandGroup] which sets the [FlowerDropDown] angle to intake from the floor, once it has
+     * reached its target, the [IntakeRollers] will be enabled. The [Indexer] is enabled simultaneously
+     * with a minimum velocity.
+     */
+    fun setFloorIntakeSequence(): Command {
+        return ParallelCommandGroup(
+            //setDropDownFloorAngle(),
+            setIntakeRollersFloorVelocity(),
+            indexOnDetection { getIntakeDetectedColor() == DetectedColor.YELLOW }
+        )
+    }
+
+    /**
+     * A [ParallelCommandGroup] which sets the [FlowerDropDown] angle to intake from the flower, once it has
+     * reached its target, the [IntakeRollers] will be enabled with their target velocity.
+     * The [Indexer] is enabled simultaneously with a minimum velocity.
+     * The [Hood] is driven to its max position if scoring in the flower is desired.
+     * The [Turret]'s target angle becomes zero, to score inside the flower.
+     */
+    fun setFlowerIntakeSequence(): Command {
+        return ParallelCommandGroup()
+    }
+
+    /**
+     * A [ParallelCommandGroup] which deploys the [FlowerDropDown], stop the [IntakeRollers] and
+     * sets the [Hood] to its home angle.
+     */
+    fun setIntakeIdle(): Command {
+        return ParallelCommandGroup(
+            //setDropDownFloorAngle(),
+            stopIntakeRollers()
+        )
+    }
+
+    /**
+     * A [com.seattlesolvers.solverslib.command.RunCommand] which receives a [Mecanum] relative target angle, which is
+     * calculated based on the current [ScoringTargets] and by compensating for the [robotTangentialVelocityToTarget]
+     * based on the robot's virtual distance. It also receives the [Mecanum]'s rotation as an argument to convert the
+     * chassis relative angle to a [Turret] angle.
+     */
+    fun setTurretCalculatedAngleSequence(): Command {
+        return setTurretCalculatedAngle(
+            {
+                mecanum.getAngleFromSubsystemToTarget(
+                    scoringTarget.toTranslation2d(), robotToTurretPose.translation,
+                )/*.minus(getTurretYawCorrection(
+                    getVirtualDistance(turretDistanceToTarget)
+                ))*/
+            }, { mecanum.getRotation() },
+        )
+    }
+
+    // --------------- ------- -------- --------------- //
+    // --------------- INDEXER COMMANDS --------------- //
+    // --------------- ------- -------- --------------- //
+
+
+    /** Enables the configurable targets of the [Indexer]. You can edit them through the Panels UI */
+    fun setIndexerConfigurableControl(): Command {
+        return indexer.enableIndexerConfigurableVelocity().InstantCommand(indexer)
+    }
+
+    /** Enables the preset velocity for shooting value of the [Indexer]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setIndexerShootingPreset(): Command {
+        return indexer.enableIndexerShootingVelocity().InstantCommand(indexer)
+    }
+
+    /** Enables the preset idle velocity value of the [Indexer]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setIndexerIdlePreset(): Command {
+        return indexer.enableIndexerIdleVelocity().InstantCommand(indexer)
+    }
+
+    /** Enables the preset reversed velocity value of the [Indexer]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setIndexerReversedPreset(): Command {
+        return indexer.enableIndexerReversedVelocity().InstantCommand(indexer)
+    }
+
+    /** Stops the [Indexer] */
+    fun stopIndexer(): Command {
+        return indexer.stopIndexer().InstantCommand(indexer)
+    }
+
+    fun indexOnDetection(ballDetected: BooleanSupplier): Command {
+        return IndexOnDetectionCommand(
+            ballDetected,
+            SubsystemTolerances.STEPPED_INDEX_TIME_FOR_STOP,
+            indexer.enableIndexerIdleVelocity(),
+            indexer.stopIndexer(),
+            indexer
+        )
+    }
+
+    /** Returns whether the [Indexer] has reached its velocity target */
+    fun isIndexerAtTarget(): Boolean {
+        return indexer.getIsAtTarget()
+    }
+
+    /** Returns whether the indexer is full of pollen */
+    fun getIndexerFull(): Boolean {
+        return indexer.isIndexerFull()
+    }
+
+    fun getTopDetectedColor(): DetectedColor {
+        return indexer.getTopDetectedColor()
+    }
+
+    fun getIntakeDetectedColor(): DetectedColor {
+        return indexer.getBottomDetectedColor()
+    }
+
+    // --------------- ------- -------- --------------- //
+    // ------------ INTAKE DEPLOY COMMANDS ------------ //
+    // --------------- ------- -------- --------------- //
+
+
+    /** Enables the configurable targets of the [FlowerDropDown]. You can edit them through the Panels UI */
+    fun setDropDownConfigurableControl(): Command {
+        return flowerDropDown.setFlowerDropDownConfigurableAngle().InstantCommand(flowerDropDown)
+    }
+
+    /** Enables the preset floor intake angle value of the [FlowerDropDown]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setDropDownFloorAngle(): Command {
+        return flowerDropDown.setFlowerDropDownFloorAngle().InstantCommand(flowerDropDown)
+    }
+
+    /** Enables the preset flower intake angle value of the [FlowerDropDown]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setDropDownFlowerAngle(): Command {
+        return flowerDropDown.setFlowerDropDownFlowerAngle().InstantCommand(flowerDropDown)
+    }
+
+    /** Returns whether the [FlowerDropDown] has reached its angle target */
+    fun isDropDownAtTarget(): Boolean {
+        return flowerDropDown.getIsAtTarget()
+    }
+
+    // --------------- ------- -------- --------------- //
+    // ------------ INTAKE ROLLERS COMMANDS ----------- //
+    // --------------- ------- -------- --------------- //
+
+    /** Enables the configurable targets of the [IntakeRollers]. You can edit them through the Panels UI */
+    fun setIntakeRollersConfigurableControl(): Command {
+        return intakeRollers.enableIntakeRollersConfigurableVelocity().InstantCommand(intakeRollers)
+    }
+
+    /** Enables the preset floor intake velocity value of the [IntakeRollers]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setIntakeRollersFloorVelocity(): Command {
+        return intakeRollers.enableIntakeRollersFloorVelocity().InstantCommand(intakeRollers)
+    }
+
+    /** Enables the preset flower intake velocity value of the [IntakeRollers]. Value can be found in [org.firstinspires.ftc.teamcode.constants.SubsystemPresetTargets] */
+    fun setIntakeRollersFlowerVelocity(): Command {
+        return intakeRollers.enableIntakeRollersFlowerVelocity().InstantCommand(intakeRollers)
+    }
+
+    fun setIntakeRollersReversedVelocity(): Command {
+        return intakeRollers.enableIntakeRollersReversedVelocity().InstantCommand(this)
+    }
+
+    /** Stops the [IntakeRollers] */
+    fun stopIntakeRollers(): Command {
+        return intakeRollers.stopIntakeRollers()
+    }
+
+    /** Returns whether the [IntakeRollers] has reached its velocity target */
+    fun isIntakeRollersAtTarget(): Boolean {
+        return intakeRollers.getIsAtTarget()
+    }
+
+    // --------------- ----- -------- --------------- //
+    // ------------- FLYWHEEL COMMANDS -------------- //
+    // --------------- ----- -------- --------------- //
+
+    /** Uses the TOF interpolation charts and the robot's [robotRadialVelocityToTarget] to calculate
+     * the virtual distance */
+    private fun getVirtualDistance(flywheelDistanceToTarget: Distance): Distance {
+        var virtualDistance: Distance = flywheelDistanceToTarget
+
+        val currentRadialVelocity: LinearVelocity = robotRadialVelocityToTarget
+
+        for (cycle in 1 .. 3) {
+            val tof = flywheel.getCalculatedScoringTimeOfFlight(virtualDistance)
+            val virtualDistanceMeters = flywheelDistanceToTarget.meters.minus(currentRadialVelocity.mps.times(tof.seconds))
+            virtualDistance = Distance.fromMeters(virtualDistanceMeters)
+        }
+
+        return virtualDistance
+    }
+
+    /** Enables the configurable targets of the [Flywheel]. You can edit them through the Panels UI */
+    fun setFlywheelConfigurableControl(): Command {
+        return flywheel.setFlywheelConfigurableVelocity().InstantCommand(flywheel)
+    }
+
+    fun setDynamicFlywheelConfigurableVelocity(): Command {
+        return setFlywheelAccelerationGains().andThen(setFlywheelConfigurableControl())
+    }
+
+    /** Enables the [Flywheel] with a calculated velocity based on the virtual distance and the robot's radial velocity */
+    fun setFlywheelIdleVelocity(): Command {
+        return flywheel.setFlywheelIdleVelocity().InstantCommand(flywheel)
+    }
+
+    fun setDynamicFlywheelIdleVelocity(): Command {
+        return setFlywheelDecelerationGains().andThen(setFlywheelIdleVelocity())
+    }
+
+    fun setFlywheelPresetShootingVelocity(): Command {
+        return flywheel.setFlywheelPresetShootingVelocity().InstantCommand(flywheel)
+    }
+
+    fun setDynamicFlywheelPresetShootingVelocity(): Command {
+        return setFlywheelAccelerationGains().andThen(setFlywheelPresetShootingVelocity())
+    }
+
+    /** Enables the [Flywheel] with a calculated velocity based on the virtual distance and the robot's radial velocity */
+    fun setFlywheelCalculatedVelocity(): Command {
+        return flywheel.setFlywheelCalculatedScoringVelocity { getVirtualDistance(turretDistanceToTarget) }
+    }
+
+    fun setDynamicCalculatedVelocity(): Command {
+        return setFlywheelAccelerationGains().andThen(setFlywheelCalculatedVelocity())
+    }
+
+    fun setFlywheelDecelerationGains(): Command {
+        return flywheel.setDeceleratingPID().InstantCommand(flywheel)
+    }
+
+    fun setFlywheelAccelerationGains(): Command {
+        return flywheel.setAcceleratingPID().InstantCommand(flywheel)
+    }
+
+    /** Stops the [Flywheel] */
+    fun stopFlywheel(): Command {
+        return flywheel.stopFlywheel()
+    }
+
+    /** Returns whether the [Flywheel] has reached its velocity target */
+    fun isFlywheelAtTarget(): Boolean {
+        return flywheel.getIsAtTarget()
+    }
+
+    // --------------- ----- -------- --------------- //
+    // --------- FLYWHEEL HARD STOP COMMANDS -------- //
+    // --------------- ----- -------- --------------- //
+
+    /** Enables the configurable targets of the [FlywheelHardStop]. You can edit them through the Panels UI */
+    fun setFlywheelHardStopConfigurableControl(): Command {
+        return flywheelHardStop.setFlywheelHardStopConfigurableAngle().InstantCommand(flywheelHardStop)
+    }
+
+    /** Clears the pathway to the [Flywheel] */
+    fun clearPathToFlywheel(): Command {
+        return flywheelHardStop.setFlywheelHardStopClearingAngle().InstantCommand(flywheelHardStop)
+    }
+
+    /** Blocks the pathway to the [Flywheel] */
+    fun blockPathToFlywheel(): Command {
+        return flywheelHardStop.setFlywheelHardStopBlockingAngle().InstantCommand(flywheelHardStop)
+    }
+
+    /** Returns whether the [FlywheelHardStop] has reached its angle target */
+    fun isFlywheelHardStopAtTarget(): Boolean {
+        return flywheelHardStop.getIsAtTarget()
+    }
+
+    // --------------- ----- -------- --------------- //
+    // ---------------- HOOD COMMANDS --------------- //
+    // --------------- ----- -------- --------------- //
+
+    /** Enables the configurable targets of the [Hood]. You can edit them through the Panels UI */
+    fun setHoodConfigurableControl(): Command {
+        return hood.setHoodConfigurableAngle().InstantCommand(hood)
+    }
+
+    /** Sets the [Hood] to its home angle (0.0°) */
+    fun setHoodHomeAngle(): Command {
+        return hood.setHoodHomeAngle().InstantCommand(hood)
+    }
+
+    /** Sets the [Hood] to its preset angle (90.0°) */
+    fun setHoodPresetAngle(): Command {
+        return hood.setHoodPresetAngle().InstantCommand(hood)
+    }
+
+    /** Enables the [Hood] with a calculated angle based on the virtual distance and the robot's radial velocity */
+    fun setHoodCalculatedAngle(): Command {
+        return hood.setHoodCalculatedAngle { turretDistanceToTarget }
+    }
+
+    /** Returns whether the [Hood] has reached its angle target */
+    fun isHoodAtTarget(): Boolean {
+        return hood.getIsAtTarget()
+    }
+
+    // --------------- ----- -------- --------------- //
+    // -------------- TURRET COMMANDS --------------- //
+    // --------------- ----- -------- --------------- //
+
+    /** Sets the turret default command, which targets the hive depending on the field zone the robot's in. */
+    fun setTurretDefaultCommand() {
+        turret.defaultCommand = setTurretCalculatedAngleSequence()
+    }
+
+    /** Calculates the angle the pollen will acquire once ejected from the turret due to the
+     * effect of [robotTangentialVelocityToTarget], the offset is ought to be applied as
+     * (theta - deltaTheta), where theta is the angle from the turret to the target
+     * @param flywheelVirtualDistanceToTarget the turret's distance to the target */
+    private fun getTurretYawCorrection(flywheelVirtualDistanceToTarget: Distance): Rotation2d {
+        val projectileVelocityMps = flywheelVirtualDistanceToTarget.meters
+            .div(flywheel.getCalculatedScoringTimeOfFlight(flywheelVirtualDistanceToTarget).seconds)
+        val tangentialVelocity: LinearVelocity = robotTangentialVelocityToTarget
+        val correction = atan2(tangentialVelocity.mps, projectileVelocityMps)
+
+        return Rotation2d(correction)
+    }
+
+    /** Enables the configurable targets of the [Turret]. You can edit them through the Panels UI */
+    fun setTurretConfigurableAngle(): Command {
+        return turret.setTurretConfigurableAngle().InstantCommand(turret)
+    }
+
+    /** Calculates the [Turret] relative angle to a target by subtracting the chassis current rotation by the
+     * chassis target angle to the target */
+    fun setTurretCalculatedAngle(chassisRelativeTargetAngle: Supplier<Rotation2d>, chassisCurrentRotation: Supplier<Rotation2d>): Command {
+        return turret.setTurretCalculatedAngleCommand(chassisRelativeTargetAngle, chassisCurrentRotation)
+    }
+
+    /** Sets the turret to its zero angle */
+    fun setTurretZeroAngle(): Command {
+        return turret.setTurretZeroAngle().InstantCommand(turret)
+    }
+
+    /** Returns whether the [Turret] has reached its angle target */
+    fun isTurretAtTarget(): Boolean {
+        return turret.getIsAtTarget()
+    }
+
+    // --------------- ----- -------- --------------- //
+    // -------------- OP MODE RUNNABLE -------------- //
+    // --------------- ----- -------- --------------- //
+
+    fun preAuto(autoCommand: Command): Runnable {
+        return { autoCommand.schedule() }
+    }
+
+    /** Returns a [Runnable] which starts the Limelight. Call [Runnable.run] for correct working */
+    fun preTeleop(): Runnable {
+        return limelight.start()
+    }
+
+    /** Returns a [Runnable] which assigns [PoseStorage.autonomousEndPose] the [Follower]'s last value. Call [Runnable.run] for correct working */
+    fun onEnd(): Runnable {
+        return { PoseStorage.autonomousEndPose = mecanum.getPose() }
+    }
+
+    // --------------- ----- -------- --------------- //
+    // ------------------ TELEMETRY ----------------- //
+    // --------------- ----- -------- --------------- //
+    fun logIndexer() {
+        indexer.log(telemetryM)
+    }
+
+    fun logIntakeDeploy() {
+        flowerDropDown.log(telemetryM)
+    }
+
+    fun logIntakeRollers() {
+        intakeRollers.log(telemetryM)
+    }
+
+    fun logFlywheel() {
+        flywheel.log(telemetryM)
+    }
+
+    fun logFlywheelHardStop() {
+        flywheelHardStop.log(telemetryM)
+    }
+
+    fun logHood() {
+        hood.log(telemetryM)
+    }
+
+    fun logTurret() {
+        turret.log(telemetryM)
+    }
+
+    // Superstructure_2.kt
+    fun logOdometry() {
+        val pose = mecanum.getPose()
+        telemetryM.addLine("Odometry")
+        telemetryM.addData("Fused X", pose.x())
+        telemetryM.addData("Fused Y", pose.y())
+        telemetryM.addData("Heading Deg", Math.toDegrees(pose.heading()))
+        telemetryM.addData("Target X", scoringTarget.x())
+        telemetryM.addData("Target Y", scoringTarget.y())
+        telemetryM.addData("Accepted Tags", poseEstimator.stats.acceptedTags)
+        telemetryM.addData("Gated Tags", poseEstimator.stats.gatedTags)
+        telemetryM.addData("Radial Velocity", robotRadialVelocityToTarget.mps)
+        telemetryM.addData("Tangential Velocity", robotTangentialVelocityToTarget.mps)
+        telemetryM.addData("Distance to target", turretDistanceToTarget.meters)
+    }
+}
